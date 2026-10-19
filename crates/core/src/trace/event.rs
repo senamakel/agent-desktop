@@ -142,7 +142,7 @@ fn reject_oversized_trace(file: &std::fs::File, incoming: u64) -> Result<(), App
     ))
 }
 
-fn with_exclusive_file<T>(
+pub(super) fn with_exclusive_file<T>(
     file: &mut std::fs::File,
     operation: impl FnOnce(&mut std::fs::File) -> Result<T, AppError>,
 ) -> Result<T, AppError> {
