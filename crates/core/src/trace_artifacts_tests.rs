@@ -390,3 +390,6 @@ fn symlinked_screens_dir_refuses_capture() {
 
 #[path = "trace_artifacts_outcome_tests.rs"]
 mod outcome_tests;
+
+#[path = "trace_artifacts_native_tests.rs"]
+mod native_tests;

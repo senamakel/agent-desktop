@@ -1,12 +1,17 @@
 use crate::AppError;
 use crate::trace_file::{open_segment_trace_file, open_trace_file};
-use crate::trace_sanitize::sanitize_trace_value;
 use crate::trace_state::{TracePending, TraceState, TraceWriterState};
-use serde_json::{Map, Value, json};
-use std::io::Write;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+mod event;
+#[cfg(test)]
+use event::write_event;
+use event::{
+    meta_fields, prepare_event, with_exclusive_file, write_event_locked, write_meta_header_locked,
+};
 
 #[cfg(test)]
 use crate::trace_file::segment_path_for_dir;
@@ -20,9 +25,73 @@ static EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
 pub struct TraceConfig {
     strict: bool,
     state: Arc<TraceState>,
+    native: Option<Arc<NativeTrace>>,
+}
+
+struct NativeTrace {
+    sink: Arc<dyn crate::TraceSink>,
+    meta_written: Mutex<bool>,
+}
+
+impl std::fmt::Debug for NativeTrace {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NativeTrace")
+            .finish_non_exhaustive()
+    }
 }
 
 impl TraceConfig {
+    pub(crate) fn with_sink(sink: Arc<dyn crate::TraceSink>, strict: bool) -> Self {
+        Self {
+            strict,
+            state: Arc::new(TraceState::default()),
+            native: Some(Arc::new(NativeTrace {
+                sink,
+                meta_written: Mutex::new(false),
+            })),
+        }
+    }
+
+    pub(crate) fn is_native(&self) -> bool {
+        self.native.is_some()
+    }
+
+    pub(crate) fn artifact(
+        &self,
+        artifact: crate::TraceArtifact<'_>,
+    ) -> Option<Result<String, AppError>> {
+        self.native.as_ref().map(|native| {
+            let limits = crate::trace_artifact_budget::limits();
+            let maximum = match artifact.kind {
+                crate::TraceArtifactKind::Screenshot => limits.screenshot_bytes,
+                crate::TraceArtifactKind::RefMap => limits.refmap_bytes,
+            };
+            if artifact.deadline.is_expired() || artifact.bytes.len() as u64 > maximum {
+                return Err(AppError::invalid_input(
+                    "Trace artifact exceeds its budget or deadline",
+                ));
+            }
+            let reference = native.sink.store_artifact(
+                artifact,
+                crate::TraceArtifactLimits {
+                    screenshot_bytes: limits.screenshot_bytes,
+                    screenshot_count: limits.screenshot_count,
+                    refmap_bytes: limits.refmap_bytes,
+                },
+            )?;
+            if reference.is_empty()
+                || reference.len() > 4096
+                || reference.chars().any(char::is_control)
+            {
+                return Err(AppError::invalid_input(
+                    "Trace sink returned an invalid artifact reference",
+                ));
+            }
+            Ok(reference)
+        })
+    }
+
     pub fn build(
         explicit_path: Option<PathBuf>,
         session_segment_dir: Option<PathBuf>,
@@ -52,6 +121,7 @@ impl TraceConfig {
             },
         };
         Ok(Self {
+            native: None,
             strict,
             state: Arc::new(TraceState {
                 pending,
@@ -76,6 +146,34 @@ impl TraceConfig {
         session_id: Option<&str>,
         fields: impl FnOnce() -> Value,
     ) -> Result<(), AppError> {
+        if let Some(native) = &self.native {
+            let result = (|| {
+                let mut meta = native
+                    .meta_written
+                    .lock()
+                    .map_err(|_| AppError::Internal("trace sink lock poisoned".into()))?;
+                if !*meta {
+                    native.sink.append(
+                        &prepare_event("trace.meta", session_id, meta_fields())?,
+                        crate::Deadline::standard()?,
+                        MAX_TRACE_FILE_BYTES,
+                    )?;
+                    *meta = true;
+                }
+                native.sink.append(
+                    &prepare_event(event, session_id, fields())?,
+                    crate::Deadline::standard()?,
+                    MAX_TRACE_FILE_BYTES,
+                )
+            })();
+            return match result {
+                Err(error) if !self.strict => {
+                    tracing::warn!(code = error.code(), "native trace append failed");
+                    Ok(())
+                }
+                other => other,
+            };
+        }
         let writer = match self.ensure_writer()? {
             Some(writer) => writer,
             None => return Ok(()),
@@ -134,6 +232,9 @@ impl TraceConfig {
     }
 
     pub(crate) fn has_sink(&self) -> bool {
+        if self.is_native() {
+            return true;
+        }
         if matches!(self.state.pending, TracePending::None) {
             return false;
         }
@@ -154,13 +255,14 @@ impl TraceConfig {
         &self,
         session_segment_dir: Option<PathBuf>,
     ) -> Result<Self, AppError> {
-        if self.pending_file_path().is_some() && self.has_sink() {
+        if self.is_native() || (self.pending_file_path().is_some() && self.has_sink()) {
             return Ok(self.clone());
         }
         match session_segment_dir {
             Some(dir) => Self::build(None, Some(dir), self.strict),
             None => Ok(Self {
                 strict: self.strict,
+                native: None,
                 state: Arc::new(TraceState::default()),
             }),
         }
@@ -181,154 +283,6 @@ impl TraceConfig {
         write_meta_header_locked(file, session_id)?;
         self.state.meta_written.store(true, Ordering::Relaxed);
         Ok(())
-    }
-}
-
-fn write_meta_header_locked(
-    file: &mut std::fs::File,
-    session_id: Option<&str>,
-) -> Result<(), AppError> {
-    write_event_locked(
-        file,
-        "trace.meta",
-        session_id,
-        json!({
-            "schema": 1,
-            "version": env!("CARGO_PKG_VERSION"),
-            "os": std::env::consts::OS,
-            "pid": std::process::id(),
-            "proc_start_ms": process_start_ms(),
-        }),
-    )
-}
-
-#[cfg(test)]
-fn write_event(
-    file: &mut std::fs::File,
-    event: &str,
-    session_id: Option<&str>,
-    fields: Value,
-) -> Result<(), AppError> {
-    with_exclusive_file(file, |file| {
-        write_event_locked(file, event, session_id, fields)
-    })
-}
-
-fn write_event_locked(
-    file: &mut std::fs::File,
-    event: &str,
-    session_id: Option<&str>,
-    fields: Value,
-) -> Result<(), AppError> {
-    let envelope_bytes = event
-        .len()
-        .saturating_mul(6)
-        .saturating_add(session_id.map_or(0, |session| session.len().saturating_mul(6)))
-        .saturating_add(512);
-    if envelope_bytes >= MAX_TRACE_EVENT_BYTES
-        || !value_fits(&fields, MAX_TRACE_EVENT_BYTES - envelope_bytes)
-    {
-        return Err(AppError::invalid_input_with_suggestion(
-            "Trace event exceeds the maximum supported event size",
-            "Emit bounded metadata and omit raw application content from trace fields.",
-        ));
-    }
-    let mut body = match sanitize_trace_value(fields) {
-        Value::Object(fields) => fields,
-        _ => Map::new(),
-    };
-    body.insert("event".to_string(), json!(event));
-    body.insert(
-        "ts_ms".to_string(),
-        json!(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|err| AppError::Internal(err.to_string()))?
-                .as_millis()
-        ),
-    );
-    body.insert(
-        "seq".to_string(),
-        json!(EVENT_SEQ.fetch_add(1, Ordering::Relaxed)),
-    );
-    body.insert("writer_pid".to_string(), json!(std::process::id()));
-    body.insert(
-        "writer_proc_start_ms".to_string(),
-        json!(process_start_ms()),
-    );
-    if let Some(sid) = session_id {
-        body.insert("session_id".to_string(), json!(sid));
-    }
-    let mut line = Vec::new();
-    serde_json::to_writer(&mut line, &Value::Object(body))?;
-    line.push(b'\n');
-    reject_oversized_trace(file, line.len() as u64)?;
-    file.write_all(&line).map_err(AppError::from)
-}
-
-fn value_fits(value: &Value, max_bytes: usize) -> bool {
-    fn visit(value: &Value, remaining: &mut usize) -> bool {
-        let fixed = match value {
-            Value::Null => 4,
-            Value::Bool(_) => 5,
-            Value::Number(_) => 32,
-            Value::String(string) => string.len().saturating_mul(6),
-            Value::Array(values) => {
-                if !take(remaining, values.len()) {
-                    return false;
-                }
-                return values.iter().all(|value| visit(value, remaining));
-            }
-            Value::Object(values) => {
-                for (key, value) in values {
-                    if !take(remaining, key.len().saturating_mul(6).saturating_add(4))
-                        || !visit(value, remaining)
-                    {
-                        return false;
-                    }
-                }
-                return true;
-            }
-        };
-        take(remaining, fixed)
-    }
-
-    fn take(remaining: &mut usize, amount: usize) -> bool {
-        let Some(next) = remaining.checked_sub(amount) else {
-            return false;
-        };
-        *remaining = next;
-        true
-    }
-
-    let mut remaining = max_bytes;
-    visit(value, &mut remaining)
-}
-
-fn reject_oversized_trace(file: &std::fs::File, incoming: u64) -> Result<(), AppError> {
-    let len = file.metadata()?.len();
-    if len.saturating_add(incoming) <= MAX_TRACE_FILE_BYTES {
-        return Ok(());
-    }
-    Err(AppError::invalid_input_with_suggestion(
-        "Trace file reached the maximum supported size",
-        "Start a new --trace file or rotate the existing trace before retrying.",
-    ))
-}
-
-fn with_exclusive_file<T>(
-    file: &mut std::fs::File,
-    operation: impl FnOnce(&mut std::fs::File) -> Result<T, AppError>,
-) -> Result<T, AppError> {
-    file.lock().map_err(AppError::from)?;
-    let result = operation(file);
-    let unlock = file.unlock().map_err(AppError::from);
-    match result {
-        Ok(value) => {
-            unlock?;
-            Ok(value)
-        }
-        Err(error) => Err(error),
     }
 }
 
