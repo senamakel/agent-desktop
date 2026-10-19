@@ -16,8 +16,6 @@ use event::{
 #[cfg(test)]
 use crate::trace_file::segment_path_for_dir;
 pub(crate) use crate::trace_file::{ensure_trace_dir, process_start_ms};
-#[cfg(test)]
-use serde_json::json;
 
 pub(crate) const MAX_TRACE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TRACE_EVENT_BYTES: usize = 1024 * 1024;
