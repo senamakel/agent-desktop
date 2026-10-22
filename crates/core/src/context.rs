@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 mod cursor;
+mod native_trace_sink;
 mod options;
 mod session_scope;
 mod wait_selector;
@@ -248,7 +249,8 @@ impl CommandContext {
             validate_session_id(id)?;
         }
         let reuses_parent_session = session_id.as_deref() == self.session_id();
-        let reuses_parent_trace = reuses_parent_session
+        let reuses_parent_trace = self.trace.is_native()
+            || reuses_parent_session
             || (self.trace.pending_file_path().is_some() && self.trace.has_sink());
         let (trace, artifacts_full) = if reuses_parent_trace {
             (self.trace.clone(), self.artifacts_full)
@@ -388,3 +390,7 @@ mod tests;
 #[cfg(test)]
 #[path = "context_scope_tests.rs"]
 mod scope_tests;
+
+#[cfg(test)]
+#[path = "context_sink_tests.rs"]
+mod sink_tests;

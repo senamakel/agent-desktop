@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod native;
+use native::NativeTrace;
+
 #[cfg(test)]
 use crate::trace_file::segment_path_for_dir;
 pub(crate) use crate::trace_file::{ensure_trace_dir, process_start_ms};
@@ -20,6 +23,7 @@ static EVENT_SEQ: AtomicU64 = AtomicU64::new(0);
 pub struct TraceConfig {
     strict: bool,
     state: Arc<TraceState>,
+    native: Option<Arc<NativeTrace>>,
 }
 
 impl TraceConfig {
@@ -52,6 +56,7 @@ impl TraceConfig {
             },
         };
         Ok(Self {
+            native: None,
             strict,
             state: Arc::new(TraceState {
                 pending,
@@ -76,6 +81,9 @@ impl TraceConfig {
         session_id: Option<&str>,
         fields: impl FnOnce() -> Value,
     ) -> Result<(), AppError> {
+        if let Some(native) = &self.native {
+            return native.emit(self.strict, event, session_id, fields);
+        }
         let writer = match self.ensure_writer()? {
             Some(writer) => writer,
             None => return Ok(()),
@@ -134,6 +142,9 @@ impl TraceConfig {
     }
 
     pub(crate) fn has_sink(&self) -> bool {
+        if self.is_native() {
+            return true;
+        }
         if matches!(self.state.pending, TracePending::None) {
             return false;
         }
@@ -154,13 +165,14 @@ impl TraceConfig {
         &self,
         session_segment_dir: Option<PathBuf>,
     ) -> Result<Self, AppError> {
-        if self.pending_file_path().is_some() && self.has_sink() {
+        if self.is_native() || (self.pending_file_path().is_some() && self.has_sink()) {
             return Ok(self.clone());
         }
         match session_segment_dir {
             Some(dir) => Self::build(None, Some(dir), self.strict),
             None => Ok(Self {
                 strict: self.strict,
+                native: None,
                 state: Arc::new(TraceState::default()),
             }),
         }
@@ -188,18 +200,13 @@ fn write_meta_header_locked(
     file: &mut std::fs::File,
     session_id: Option<&str>,
 ) -> Result<(), AppError> {
-    write_event_locked(
-        file,
-        "trace.meta",
-        session_id,
-        json!({
-            "schema": 1,
-            "version": env!("CARGO_PKG_VERSION"),
-            "os": std::env::consts::OS,
-            "pid": std::process::id(),
-            "proc_start_ms": process_start_ms(),
-        }),
-    )
+    write_event_locked(file, "trace.meta", session_id, meta_fields())
+}
+
+fn meta_fields() -> Value {
+    json!({ "schema": 1, "version": env!("CARGO_PKG_VERSION"),
+        "os": std::env::consts::OS, "pid": std::process::id(),
+        "proc_start_ms": process_start_ms() })
 }
 
 #[cfg(test)]
@@ -214,12 +221,7 @@ fn write_event(
     })
 }
 
-fn write_event_locked(
-    file: &mut std::fs::File,
-    event: &str,
-    session_id: Option<&str>,
-    fields: Value,
-) -> Result<(), AppError> {
+fn prepare_event(event: &str, session_id: Option<&str>, fields: Value) -> Result<Value, AppError> {
     let envelope_bytes = event
         .len()
         .saturating_mul(6)
@@ -259,8 +261,18 @@ fn write_event_locked(
     if let Some(sid) = session_id {
         body.insert("session_id".to_string(), json!(sid));
     }
+    Ok(Value::Object(body))
+}
+
+fn write_event_locked(
+    file: &mut std::fs::File,
+    event: &str,
+    session_id: Option<&str>,
+    fields: Value,
+) -> Result<(), AppError> {
+    let body = prepare_event(event, session_id, fields)?;
     let mut line = Vec::new();
-    serde_json::to_writer(&mut line, &Value::Object(body))?;
+    serde_json::to_writer(&mut line, &body)?;
     line.push(b'\n');
     reject_oversized_trace(file, line.len() as u64)?;
     file.write_all(&line).map_err(AppError::from)
