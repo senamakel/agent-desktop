@@ -8,6 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+mod native;
+use native::NativeTrace;
+
 #[cfg(test)]
 use crate::trace_file::segment_path_for_dir;
 pub(crate) use crate::trace_file::{ensure_trace_dir, process_start_ms};
@@ -23,70 +26,7 @@ pub struct TraceConfig {
     native: Option<Arc<NativeTrace>>,
 }
 
-struct NativeTrace {
-    sink: Arc<dyn crate::TraceSink>,
-    meta_written: Mutex<bool>,
-}
-
-impl std::fmt::Debug for NativeTrace {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("NativeTrace")
-            .finish_non_exhaustive()
-    }
-}
-
 impl TraceConfig {
-    pub(crate) fn with_sink(sink: Arc<dyn crate::TraceSink>, strict: bool) -> Self {
-        Self {
-            strict,
-            state: Arc::new(TraceState::default()),
-            native: Some(Arc::new(NativeTrace {
-                sink,
-                meta_written: Mutex::new(false),
-            })),
-        }
-    }
-
-    pub(crate) fn is_native(&self) -> bool {
-        self.native.is_some()
-    }
-
-    pub(crate) fn artifact(
-        &self,
-        artifact: crate::TraceArtifact<'_>,
-    ) -> Option<Result<String, AppError>> {
-        self.native.as_ref().map(|native| {
-            let limits = crate::trace_artifact_budget::limits();
-            let maximum = match artifact.kind {
-                crate::TraceArtifactKind::Screenshot => limits.screenshot_bytes,
-                crate::TraceArtifactKind::RefMap => limits.refmap_bytes,
-            };
-            if artifact.deadline.is_expired() || artifact.bytes.len() as u64 > maximum {
-                return Err(AppError::invalid_input(
-                    "Trace artifact exceeds its budget or deadline",
-                ));
-            }
-            let reference = native.sink.store_artifact(
-                artifact,
-                crate::TraceArtifactLimits {
-                    screenshot_bytes: limits.screenshot_bytes,
-                    screenshot_count: limits.screenshot_count,
-                    refmap_bytes: limits.refmap_bytes,
-                },
-            )?;
-            if reference.is_empty()
-                || reference.len() > 4096
-                || reference.chars().any(char::is_control)
-            {
-                return Err(AppError::invalid_input(
-                    "Trace sink returned an invalid artifact reference",
-                ));
-            }
-            Ok(reference)
-        })
-    }
-
     pub fn build(
         explicit_path: Option<PathBuf>,
         session_segment_dir: Option<PathBuf>,
@@ -142,32 +82,7 @@ impl TraceConfig {
         fields: impl FnOnce() -> Value,
     ) -> Result<(), AppError> {
         if let Some(native) = &self.native {
-            let result = (|| {
-                let mut meta = native
-                    .meta_written
-                    .lock()
-                    .map_err(|_| AppError::Internal("trace sink lock poisoned".into()))?;
-                if !*meta {
-                    native.sink.append(
-                        &prepare_event("trace.meta", session_id, meta_fields())?,
-                        crate::Deadline::standard()?,
-                        MAX_TRACE_FILE_BYTES,
-                    )?;
-                    *meta = true;
-                }
-                native.sink.append(
-                    &prepare_event(event, session_id, fields())?,
-                    crate::Deadline::standard()?,
-                    MAX_TRACE_FILE_BYTES,
-                )
-            })();
-            return match result {
-                Err(error) if !self.strict => {
-                    tracing::warn!(code = error.code(), "native trace append failed");
-                    Ok(())
-                }
-                other => other,
-            };
+            return native.emit(self.strict, event, session_id, fields);
         }
         let writer = match self.ensure_writer()? {
             Some(writer) => writer,
